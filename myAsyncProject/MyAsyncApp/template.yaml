@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: API Gateway REST API for API clave
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 100
+    Handler: app.handler
+    LoggingConfig:
+      #ApplicationLogLevel: DEBUG
+      #LogFormat: Text
+      LogGroup: '/aws/lambda/MyAsyncFunction'
+    #SystemLogLevel: INFO
+    Architectures:
+      - arm64
+
+Resources:
+  MyAsyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      FunctionName: MyAsyncFunction
+      Role: !GetAtt ApiGatewayIamRole.Arn
+      EventInvokeConfig:
+        MaximumEventAgeInSeconds: 60
+        MaximumRetryAttempts: 1
+        DestinationConfig:
+          OnFailure:
+            Destination: !GetAtt SQSFail.Arn
+            Type: SQS
+          OnSuccess:
+            Destination: !GetAtt SQS.Arn
+            Type: SQS
+      DeadLetterQueue:
+        TargetArn: !GetAtt SQSDLQ.Arn
+        Type: SQS
+
+  ApiGatewayIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      MaxSessionDuration: 3600
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      RoleName: lambda_exce_role-Poc-sam-1
+
+  #REST API GENERAL
+  ApiGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Name: myAsyncFuntction
+
+  #REST API RESOURCES
+  ApiGatewayResourceL1:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: poc
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ApiGatewayResourceL2:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGatewayResourceL1.ResourceId
+      PathPart: commands
+      RestApiId: !Ref ApiGatewayRestApi
+
+  #REST API METHODS
+  ApiGatewayPostMethodL2:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ApiKeyRequired: false
+      AuthorizationType: NONE
+      HttpMethod: POST
+      RequestParameters:
+        method.request.header.InvocationType: false
+      Integration:
+        Type: AWS
+        RequestParameters:
+          integration.request.header.X-Amz-Invocation-Type: method.request.header.InvocationType
+        IntegrationResponses:
+          - StatusCode: '202'
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${MyAsyncFunction}/invocations
+      MethodResponses:
+        - StatusCode: '202'
+          ResponseModels:
+            application/json: Empty
+      ResourceId: !Ref ApiGatewayResourceL2
+      RestApiId: !Ref ApiGatewayRestApi
+  
+  ApiGatewayResourceL3:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGatewayResourceL1.ResourceId
+      PathPart: sync
+      RestApiId: !Ref ApiGatewayRestApi
+  
+  ApiGatewayGetMethodL3:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ApiKeyRequired: false
+      AuthorizationType: NONE
+      HttpMethod: GET
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:MyAsyncFunction/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+      ResourceId: !Ref ApiGatewayResourceL3
+      RestApiId: !Ref ApiGatewayRestApi
+  
+  LambdaInvokePermissionFull:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !Ref MyAsyncFunction
+      Principal: '*'
+      Action: '*'
+    DependsOn:
+      - ApiGatewayPostMethodL2
+      - ApiGatewayGetMethodL3
+  
+
+  MyLogGroupLambda:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: '/aws/lambda/MyAsyncFunction'
+      RetentionInDays: 7
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+
+
+  #REST API DEPLOYMENT
+  Deployment4:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiGatewayPostMethodL2
+      - ApiGatewayGetMethodL3
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+
+  #REST API STAGE
+  Stage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: pruebas
+      RestApiId: !Ref ApiGatewayRestApi
+      DeploymentId: !Ref Deployment4
+      MethodSettings:
+        - HttpMethod: '*'
+          LoggingLevel: 'ERROR'
+          MetricsEnabled: true
+          ResourcePath: '/*'
+
+  #REST API STAGE LOGGROUP
+  MyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub
+        - 'API-Gateway-Execution-Logs_${APIID}/pruebas'
+        - APIID: !Ref ApiGatewayRestApi
+      RetentionInDays: 7
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+  
+  SQS:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsDataKeyReusePeriodSeconds: 86400
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 345600
+      QueueName: MyQueue-async
+      VisibilityTimeout: 300
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+
+  SQSFail:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsDataKeyReusePeriodSeconds: 86400
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 345600
+      QueueName: MyQueue-async-fail
+      VisibilityTimeout: 300
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+  
+  SQSDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsDataKeyReusePeriodSeconds: 86400
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 345600
+      QueueName: MyQueue-DLQ
+      VisibilityTimeout: 300
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+
+#OUTPUTS
+Outputs:
+  ApigwId:
+    Description: 'The ID of the api'
+    Value: !Sub https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/pruebas/poc
+    Export:
+      Name: apigw
